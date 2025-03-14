@@ -1,0 +1,28 @@
+#! /bin/tcsh -f
+
+echo ""
+echo "This file can be used for post-processing commands after a coupled batch job."
+echo ""
+echo "It is located in $SOLPSTOP/scripts.local/QSUB.postprocess_coupled."
+echo ""
+
+# Here is what was being done explicitly in QSUB.sge_coupled:
+
+# Remove possibly stale b2fplasmf
+if (-e b2fplasmf) then
+    echo 'Removing b2fplasmf'
+    rm -f b2fplasmf
+    if (-e b2uf.prt) then
+        rm -f b2uf.prt
+    endif
+endif
+# Create new b2fplasmf
+myb2uf
+# Modified tar_important_files to save b2fplasmf to make it quicker to fully restore a case for analysis
+tar_important_files_incl_b2fplasmf
+
+summarize_run
+
+[ -e run.log ] && gzip -9 -f run.log
+
+post

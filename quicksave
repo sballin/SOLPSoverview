@@ -1,0 +1,510 @@
+#!/bin/env python3
+'''
+Save the run parameters you care about to an hdf5 file instead of leaving everything in a giant .tar.gz file.
+
+Sean Ballinger
+'''
+import sys, os
+import subprocess
+import datetime
+import traceback
+import glob
+import gzip
+import datetime
+import pytz
+import re
+import shutil
+
+import h5py
+import numpy as np
+np.seterr(divide='ignore', invalid='ignore') # suppress RuntimeWarning: invalid value encountered in true_divide
+from scipy.optimize import curve_fit
+from scipy.special import erfc
+from scipy.io import netcdf
+import scipy.interpolate as interpolate
+import f90nml
+parser = f90nml.Parser() # It works, but it doesn't like things like userfluxparm(1,1) = bunch of numbers. It wants userfluxparm(:,1) = bunch of numbers
+
+import warnings
+# suppress f90nml warning
+warnings.filterwarnings("ignore", message=".*Value .* is not assigned to any variable and has been removed.*")
+
+import aurora # suppress cryptography deprecation warning with pip install cryptography==2.5
+from aurora import coords
+# from omfit_classes import omfit_eqdsk
+import solpspy
+import quixote
+
+from writeb2settings import getb2settings
+
+
+def argnear(array, value):
+    return np.argmin(np.abs(np.array(array)-value))
+
+
+def parseDat(filename):
+    out = {}
+    with open(filename, 'r') as f:
+        txt = f.read()
+    lines = txt.split('\n')
+    for l in lines:
+        try:
+            if l[0] == "'":
+                l = l.split('#')[0]
+                key, val = l.split() 
+                key = key.replace("'", "")
+                val = float(val.replace("'", ""))
+                out[key] = val
+        except Exception as e:
+            pass
+    return out
+
+
+def getResiduals():
+    file_in = "b2mn.exe.dir/b2ftrace" 
+    if not os.path.isfile(file_in):
+        file_in = "b2ftrace"
+        if not os.path.isfile(file_in):
+            print("Error: Could not find b2ftrace")
+
+    with open(file_in) as f:
+        lines = f.readlines()
+
+    mydatalist = []
+    counter = 0
+    read_data = False
+    for line in lines:
+        if "data" in line:
+            counter += 1
+            read_data = True
+            continue
+        if read_data:
+            line = line.split()
+            part_list = [float(i) for i in line]
+            mydatalist.extend(part_list)
+        
+    mydata = np.array(mydatalist)
+    mydata = mydata.reshape(counter,int(len(mydatalist)/counter))
+    return mydata
+
+
+def get_b2tallies(var):
+    '''
+    returns (times, vals)
+    fixed up from solpspy: https://gitlab.com/ipar/solpspy/-/blob/master/solpspy/classes/rundir.py#L1684'''
+    exeb2tallies = os.path.join('b2mn.exe.dir/b2tallies.nc')
+    b2tallies = os.path.join('b2tallies.nc')
+
+    if os.access(exeb2tallies, os.R_OK):
+        ftallies=netcdf.netcdf_file(exeb2tallies,'r')
+    elif os.access(b2tallies, os.R_OK):
+        ftallies=netcdf.netcdf_file(b2tallies,'r')
+
+    times = ftallies.variables['times'][:].copy()
+    data =  ftallies.variables[var][:].copy()
+    ftallies.close()
+    return times, data
+
+        
+def get_pumped_fluxes():
+    i = 0
+
+    D_pumped_pump = []
+    i_D_pumped_pump = []
+    T_pumped_pump = []
+    i_T_pumped_pump = []
+
+    D_pumped_core = []
+    i_D_pumped_core = []
+    T_pumped_core = []
+    i_T_pumped_core = []
+
+    influx = []
+    i_influx = []
+
+    ipumped = 0
+    iinflux = 0
+    
+    if os.path.isfile('run.log.gz'):
+        f = gzip.open('run.log.gz','rt') # if in working directory right after run
+    elif os.path.isfile('run.log'):
+        f = open('run.log') # if opening [date].tar.gz save
+    reading_pumped = False
+    for l in f:
+        # Empty line signals end of flux readout
+        if reading_pumped and len(l.split()) == 0:
+            reading_pumped = False
+            D_pumped_pump.append(Dpumpiter)
+            i_D_pumped_pump.append(ipumped)
+            T_pumped_pump.append(Tpumpiter)
+            i_T_pumped_pump.append(ipumped)
+
+            D_pumped_core.append(Dcoreiter)
+            i_D_pumped_core.append(ipumped)
+            T_pumped_core.append(Tcoreiter)
+            i_T_pumped_core.append(ipumped)
+            ipumped += 1
+            continue
+        
+        if reading_pumped:
+            surf, species, flux = l.split()
+            if '10' in surf and 'D' in species:
+                if '2' in species:
+                    Dpumpiter += 2*float(flux)/1.602e-19
+                else:
+                    Dpumpiter += float(flux)/1.602e-19
+            if '10' in surf and 'T' in species:
+                if '2' in species:
+                    Tpumpiter += 2*float(flux)/1.602e-19
+                else:
+                    Tpumpiter += float(flux)/1.602e-19
+            if '-1' in surf and 'D' in species:
+                if '2' in species:
+                    Dcoreiter += 2*float(flux)/1.602e-19
+                else:
+                    Dcoreiter += float(flux)/1.602e-19
+            if '-1' in surf and 'T' in species:
+                if '2' in species:
+                    Tcoreiter += 2*float(flux)/1.602e-19
+                else:
+                    Tcoreiter += float(flux)/1.602e-19
+            continue
+                    
+        if 'NO. SPECIES  PUMPED FLUX' in l:
+            reading_pumped = True
+            Dpumpiter = 0
+            Tpumpiter = 0
+            Dcoreiter = 0
+            Tcoreiter = 0
+            continue
+        
+        if 'INFLUX=' in l:
+            _, flux = l.split()
+            influx.append(float(flux)/1.602e-19)
+            i_influx.append(iinflux)
+            iinflux += 1
+            continue
+    f.close()
+            
+    D_pumped_pump = np.array(D_pumped_pump)
+    i_D_pumped_pump = np.array(i_D_pumped_pump)
+    T_pumped_pump = np.array(T_pumped_pump)
+    i_T_pumped_pump = np.array(i_T_pumped_pump)
+    D_pumped_core = np.array(D_pumped_core)
+    i_D_pumped_core = np.array(i_D_pumped_core)
+    T_pumped_core = np.array(T_pumped_core)
+    i_T_pumped_core = np.array(i_T_pumped_core)
+    return np.mean(D_pumped_pump), np.mean(T_pumped_pump)
+        
+dpi = 150
+scriptdir = '/home/sballinger/solps_utils'
+
+def quicksave(jobid=None):
+    geqdsk = glob.glob('../baserun/*.geq*')[0]
+    so = aurora.solps_case(b2fstate_path="./b2fstate", b2fgmtry_path="../baserun/b2fgmtry", geqdsk=geqdsk)
+    sp = solpspy.SolpsData('.', mag='lsn')
+    spq = quixote.SolpsData('.')
+
+    if os.path.isfile('b2fplasmf'):
+        if not np.all(sp.ne[1:-1,1:-1].T/so.ne == 1.0):
+            raise Exception('Non-matching b2fstate and b2fplasmf files. Do b2run b2uf or remove b2fplasmf.')
+
+    # Modified from Aurora
+    # now obtain also the simple poloidal grid slice near the midplane (LFS and HFS)
+    # These are commonly used for SOLPS analysis, using the JXA and JXI indices (which we re-compute here)
+    Z_core = so.data("cz")[so.unit_r:2*so.unit_r, so.unit_p:3*so.unit_p]
+    R_core = so.data("cr")[so.unit_r:2*so.unit_r, so.unit_p:3*so.unit_p]
+
+    # find indices of poloidal grid nearest to Z=0 in the innermost radial shell
+    midplane_LFS_idx = np.argmin(np.abs(Z_core[0, R_core[0, :] > so.geqdsk["RMAXIS"]]))
+    midplane_HFS_idx = np.argmin(np.abs(Z_core[0, R_core[0, :] < so.geqdsk["RMAXIS"]]))
+
+    # convert to indices on so.data('cz') and so.data('cr')
+    JXI = so.unit_p + np.arange(Z_core.shape[1])[R_core[0, :] < so.geqdsk["RMAXIS"]][midplane_HFS_idx] # HFS_mid_pol_idx
+    JXA = so.unit_p + np.arange(Z_core.shape[1])[R_core[0, :] > so.geqdsk["RMAXIS"]][midplane_LFS_idx] # LFS_mid_pol_idx
+
+    yyc = np.loadtxt('dsa')[1:-1]*1000 #rmid(so, so.geqdsk)*1000
+    yyclabel = '$R_{omp}-R_{sep}$ [mm]'
+    isp = sp.species_names.index('H+') # ion species index
+
+    i = sp.oxp
+    ig = 0
+    f = interpolate.interp1d(so.geqdsk.get2D('PSIRZ_NORM', sp.cr[i,1:-1], sp.cz[i,1:-1], interp='cubic'), yyc, fill_value='extrapolate', kind='cubic')
+    yyct = f(so.geqdsk.get2D('PSIRZ_NORM', sp.cr[i+1,1:-1], sp.cz[i+1,1:-1], interp='cubic'))
+    
+    resids = getResiduals()
+    iterations = np.shape(resids)[0]
+    b2mn = parseDat('b2mn.dat')
+    timestep = b2mn["b2mndr_dtim"]
+    Psep = np.sum((sp.fhey+sp.fhiy)[sp.ixp:sp.oxp+1,sp.sep])
+    isep = argnear(yyc, 0)
+    nesep = interpolate.interp1d(yyc, so.ne[:,JXA]/1e20, kind='linear')(0)
+    nefarsol = so.ne[-1,JXA]/1e20
+    necore = so.ne[0,JXA]/1e20
+    tesep = interpolate.interp1d(yyc, so.te[:,JXA], kind='linear')(0)
+    
+    # power balance
+    Pinner = np.sum(-spq.fhtx[1,1:-1])
+    Pouter = np.sum(spq.fhtx[-1,1:-1])
+    Pwalls = np.sum(spq.fhty[1:-1,-1]) + -np.sum(spq.fhty[sp.oxp+1:,1]) + -np.sum(spq.fhty[:sp.ixp,1])
+    Prad = sp.line_radiation.sum()
+    Pout = Pinner + Pouter + Pwalls + Prad
+    
+    # lambda_q outboard x-point
+    iy = sp.sep-1
+    ixp = spq.leftcut[0]+1
+    oxp = spq.rightcut[0]+1
+    Ptot = spq.fhtx
+    Ptotei = spq.fhex + spq.fhix
+    qpol = Ptot/sp.sx # wrong, sx is different here
+    qpar = qpol/sp.pitch
+    qsurf = Ptot/sp.sx # not sure if sx is east or west, sx[0,:] is all zeros, and difference between sx[1,:] and sx[2,:] is ~1%
+    qsurfei = Ptotei/sp.sx
+
+    def fit_exp(yyc, q, color):
+        def expfun(x, A, lamda_inv):
+            """
+            Exponential function for curve fitting.
+            
+            Parameters:
+            x: Array of x values
+            A: Amplitude of exponential
+            lamda_inv: Inverse decay length (1/lambda) (necessary for curve_fit to work nicely)
+            """
+            return A*np.exp(-x*lamda_inv)
+        
+        istart = np.argmax(q)
+        mmstart = yyc[istart]
+        mmend = mmstart+1 # fit up to 1 mm away from peak
+        iend = argnear(yyc, mmend)
+        # if heat flux profile is non-monotonic, only fit part before it starts rising again
+        for i in range(istart+1, iend+1):
+            if q[i] > q[i-1]:
+                iend = i-1
+                mmend = yyc[iend]
+                break
+        qofit, _ = curve_fit(expfun, yyc[istart:iend+1], q[istart:iend+1], p0=[np.max(q),1], bounds=(0, np.inf))
+        lamda = 1/qofit[1] # lamda_q in mm
+        return lamda
+
+    # fit qpar tot at X-point
+    ptot = spq.fhtx
+    sxpol = sp.sx*sp.qc
+    wbbl = quixote.tools.parsers.b2('../baserun/b2fgmtry', 'wbbl', spq.bb.shape)
+    q = ptot/sxpol*wbbl[:,:,3]/np.abs(wbbl[:,:,0])
+    try:
+        lamda_xo = fit_exp(yyct[sp.sep-1:], q[oxp,sp.sep:-1]/1e9, 'C0')
+    except Exception as e:
+        print(traceback.format_exc())
+        lamda_xo = None
+
+    #-radial profile of qpar below entrance to the outer leg
+    psurfo = Ptot[-1,:]
+    qsurfo = psurfo[1:-1]/sp.sx[-1,1:-1]
+
+    def qEich(rho, q0, S, lqi, qbg, rho_0):
+            rho = rho - rho_0
+            # lqi is inverse lamda_q
+            return q0/2*np.exp((S*lqi/2)**2-rho*lqi)*erfc(S*lqi/2-rho/S)+qbg
+
+    if lamda_xo != None:
+        lqoGuess = lamda_xo
+    else:
+        lqoGuess = 1 # mm
+    # lamda_q fits
+    yycm = yyct/1000
+    yycml = np.linspace(yycm[0], yycm[-1], 500)
+    bounds = ([0,0,0,0,yycm[0]], [np.inf,np.inf,np.inf,np.inf,yycm[-1]])
+    # Fit outer
+    oguess = (np.max(qsurfo)-np.min(qsurfo), lqoGuess/1000/2, 1000/lqoGuess, np.min(qsurfo), 0)
+    try:
+        qsurfol = interpolate.interp1d(yycm, qsurfo)(yycml)
+        qsofit, _ = curve_fit(qEich, yycml, qsurfol, p0=oguess, bounds=bounds)
+        lqeo, So = 1000/qsofit[2], qsofit[1]*1000 # lamda_q and S in mm
+    except Exception as e:
+        print('qsurf outer fit failed:', e)
+        qsofit = None
+    
+    # q max at inner, outer target using b2 variables
+    qsurf = spq.fhtx/sp.sx
+    qsurf_max_inner = np.max(-qsurf[1,1:-1]/1e6)
+    qsurf_max_outer = np.max(qsurf[-1,1:-1]/1e6)
+    
+    # wlld data for full impurity model radiation heat flux handling
+    try:
+        shutil.rmtree('b2pl.exe.dir')
+    except Exception as e:
+        pass
+    result = subprocess.run('echo "0100 wlld" | b2plot', shell=True, executable='/bin/tcsh', stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if os.path.isfile('b2pl.exe.dir/ld_tg_i.dat') and os.path.isfile('b2pl.exe.dir/ld_tg_o.dat'):
+        cols = ['x','ne','Te','Ti','Wtot','Wpart','Wrad','Wpls','Wneut','Wheat','Wpot','Whtpl','Wptpl','xMP','Rclfc','Zclfc','Wpar_xpt','WWpar','WWtrg','Lcnnt','Lcnnx']
+        datai = np.loadtxt('b2pl.exe.dir/ld_tg_i.dat').T
+        it = {cols[i]: datai[i] for i in range(len(cols))}
+        datao = np.loadtxt('b2pl.exe.dir/ld_tg_o.dat').T
+        ot = {cols[i]: datao[i] for i in range(len(cols))}
+        qsurf_max_inner = np.max(it['Wtot'])/1e6
+        qsurf_max_outer = np.max(ot['Wtot'])/1e6
+        Pinner = np.sum(it["Wtot"]*sp.sx[1,1:-1])
+        Pouter = np.sum(ot["Wtot"]*sp.sx[-1,1:-1])
+    
+    # divertor pressure
+    # Get density right in front of semi-transparent surface
+    def get_triangle_centers():
+        '''so.triangles contains indices of nodes of each triangle'''
+        xc = []
+        yc = []
+        for t in so.triangles:
+            xc.append(np.mean([so.xnodes[int(t[i])] for i in [0,1,2]]))
+            yc.append(np.mean([so.ynodes[int(t[i])] for i in [0,1,2]]))
+        xc = np.array(xc)
+        yc = np.array(yc)
+        return xc, yc
+    try:
+        D_pumped_flux, T_pumped_flux = get_pumped_fluxes()
+        xc, yc = get_triangle_centers()
+        mask = (1.78<xc)&(xc<1.835)&(-1.405<yc)&(yc<-1.385)
+        vals = np.sum(sp.pdena[:, :], axis=1)+2*np.sum(sp.pdenm[:, :], axis=1)
+        ngdiv = np.mean(vals.flatten()[mask])
+        pump_surface_area = 0.719 # m^-2
+        S_pump = (T_pumped_flux+D_pumped_flux)/pump_surface_area/ngdiv
+    except Exception as e:
+        print('pumping quantities error:', e)
+        ngdiv = np.nan
+        S_pump = np.nan
+        D_pumped_flux = np.nan
+        T_pumped_flux = np.nan
+    
+    # change in total particles and energy
+    
+    # abs normalized particle error
+    
+    # lambda_n
+    try:
+        expfun = lambda x, A, lamda_inv: A*np.exp(-x*lamda_inv) # needs to be in this form for curve_fit to work
+        mmstart = -0.2
+        mmend = 2
+        istart = argnear(yyc, mmstart)
+        iend = argnear(yyc, mmend)
+        isep = argnear(yyc, 0)
+        qofit, _ = curve_fit(expfun, yyc[istart:iend], so.ne[istart:iend,JXA]/1e20, p0=[np.max(so.ne[istart:iend,JXA]/1e20),1], bounds=(0, np.inf))
+        lambda_n = 1/qofit[1] # lamda_n in mm
+    except Exception as e:
+        print('lambda_n error:', e)
+        lambda_n = np.nan
+    
+    # Te,Ti max at targets
+    te_outer_max = np.max(so.te[:,-1])
+    ti_outer_max = np.max(so.ti[:,-1])
+    te_inner_max = np.max(so.te[:,0])
+    ti_inner_max = np.max(so.ti[:,0])
+
+    # Impurity fraction
+    nuclei = [re.findall(r'[a-zA-Z]+', s)[0] for s in sp.species_names] # e.g. ['H', 'H', 'H', 'H'] for DT
+    nuclei_nice = [] # e.g. ['D', 'D', 'T', 'T'] for DT
+    for i in range(len(sp.zn)):
+        if sp.zn[i] == 1:
+            spec = 'H'
+            if sp.am[i] == 2:
+                spec = 'D'
+            elif sp.am[i] == 3:
+                spec = 'T'
+        else:
+            spec = nuclei[i]
+        nuclei_nice.append(spec)
+    nucset = list(set(nuclei))
+    nuclei_nice_set = list(set(nuclei_nice))
+    if nucset == ['H']:
+        has_impurities = False
+        impurity = None
+        imp_percent_core = np.nan
+        imp_percent_sol = np.nan
+    else:
+        has_impurities = True
+        impurity = [i for i in nucset if i != 'H'][0]
+        imp_ion_indices = np.where((np.array(nuclei)==impurity)*(sp.za >= 1))[0]
+        imp_dens = np.sum(sp.na[:,:,imp_ion_indices], axis=2)
+        ecount_sol = np.sum((sp.ne*sp.vol)[sp.masks.sol])
+        impcount_sol = np.sum((imp_dens*sp.vol)[sp.masks.sol])
+        ecount_core = np.sum((sp.ne*sp.vol)[sp.masks.core])
+        impcount_core = np.sum((imp_dens*sp.vol)[sp.masks.core])
+        imp_percent_core = 100*impcount_core/ecount_core
+        imp_percent_sol = 100*impcount_sol/ecount_sol
+
+
+    # H ion fluxes
+    t, f = get_b2tallies('fnayreg')
+    n_ion_indices = np.where((np.array(nuclei)=='H')*(sp.za >= 1))[0]
+    H_flux_core = np.sum(f[-1,n_ion_indices,2])
+    H_flux_MC = np.sum(f[-1,n_ion_indices,6])
+    
+    # date
+    modification_time = os.path.getmtime('b2fstate')
+    mod_datetime = datetime.datetime.fromtimestamp(modification_time, pytz.utc)
+    mod_datetime = mod_datetime.astimezone(pytz.timezone('CET')).strftime("%y-%m-%d %I:%M %p")
+    
+    # seconds per iteration
+    try:
+        if jobid == None:
+            jobid = os.environ['SLURM_JOB_ID']
+        time_elapsed = subprocess.getoutput(f'sacct -j {jobid} --format=Elapsed --noheader').split('\n')[0].strip()
+        hours, minutes, seconds = map(int, time_elapsed.split(':'))
+        seconds_elapsed = hours * 3600 + minutes * 60 + seconds
+        s_per_iter = seconds_elapsed/iterations
+    except Exception as e:
+        print('s_per_iter error:', e)
+        traceback.print_exc()
+        s_per_iter = np.nan
+    
+    hostname = subprocess.getoutput('hostname')
+    cwd = os.getcwd()
+    checksum_b2fstati = subprocess.getoutput('md5sum b2fstati').split()[0]
+    checksum_b2fstate = subprocess.getoutput('md5sum b2fstate').split()[0]
+
+    b2_settings = getb2settings('.')
+    with open('input.dat', 'r') as f:
+        eirene_settings = f.read()
+        
+    def h5create(h5, name, data, units=''):
+        h5.create_dataset(name, data=data).attrs['units'] = units.encode('utf-8')
+        
+    with h5py.File('quicksave.h5', 'a') as h5:
+        h5create(h5, 'date', mod_datetime)
+        h5create(h5, 'hostname', hostname)
+        h5create(h5, 'cwd', cwd)
+        h5create(h5, 'checksum_b2fstati', checksum_b2fstati)
+        h5create(h5, 'checksum_b2fstate', checksum_b2fstate)
+        h5create(h5, 'b2_settings', b2_settings)
+        h5create(h5, 'eirene_settings', eirene_settings)
+        h5create(h5, 'iterations', iterations)
+        h5create(h5, 'timestep', timestep, ' s')
+        h5create(h5, 's_per_iter', s_per_iter, ' s')
+        h5create(h5, 'nesep', nesep, 'e20 m⁻³')
+        h5create(h5, 'nefarsol', nefarsol, 'e20 m⁻³')
+        h5create(h5, 'necore', necore, 'e20 m⁻³')
+        h5create(h5, 'λ_n', lambda_n, ' mm')
+        h5create(h5, 'Tesep', tesep, ' eV')
+        h5create(h5, 'Psep', Psep/1e6, ' MW')
+        h5create(h5, 'Pout', Pout/1e6, ' MW')
+        h5create(h5, 'Pouter', Pouter/1e6, ' MW')
+        h5create(h5, 'Pinner', Pinner/1e6, ' MW')
+        h5create(h5, 'Pwalls', Pwalls/1e6, ' MW')
+        h5create(h5, 'Prad', Prad/1e6, ' MW')
+        h5create(h5, 'λ_q_xpt_outer', lamda_xo, ' mm')
+        h5create(h5, 'λ_q_outer', lqeo, ' mm')
+        h5create(h5, 'S_outer', So, ' mm')
+        h5create(h5, 'Teoutermax', te_outer_max, ' eV')
+        h5create(h5, 'Tioutermax', ti_outer_max, ' eV')
+        h5create(h5, 'qoutermax', qsurf_max_outer, ' MW/m²')
+        h5create(h5, 'qinnermax', qsurf_max_inner, ' MW/m²')
+        h5create(h5, 'H_flux_core', H_flux_core/1e20, 'e20 /s')
+        h5create(h5, 'H_flux_MC', H_flux_MC/1e20, 'e20 /s')
+        h5create(h5, 'D_pumped', D_pumped_flux/1e20, 'e20 /s')
+        h5create(h5, 'T_pumped', T_pumped_flux/1e20, 'e20 /s')
+        h5create(h5, 'imp_percent_core', imp_percent_core, '%')
+        h5create(h5, 'imp_percent_sol', imp_percent_sol, '%')
+        h5create(h5, 'ngdiv', ngdiv/1e20, 'e20 m⁻³')
+        h5create(h5, 'S_pump', S_pump)
+        
+if __name__ == '__main__':
+    quicksave()
+    

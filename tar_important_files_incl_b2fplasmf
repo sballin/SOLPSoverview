@@ -1,0 +1,16 @@
+#! /bin/tcsh -f
+
+###                save important files as a single tar file                ###
+
+mkdir $USER.work.$$
+if (${COMPILER} == "HP") then
+mv b2.*.parameters b2.*.inputfile b2.*.profile input.dat b2mn.dat b2fgmtry b2fpardf b2fstati b2frates b2mn.prt b2fparam b2fstate b2fplasmf b2ftrace b2fplasma *.nc ftn13 ftn15 ftn3[01] ftn3[3-5] ftn44 ftn46 run.log ds* output.* ??3d*.last10 $USER.work.$$/
+else
+mv b2.*.parameters b2.*.inputfile b2.*.profile input.dat b2mn.dat b2fgmtry b2fpardf b2fstati b2frates b2mn.prt b2fparam b2fstate b2fplasmf b2ftrace b2fplasma *.nc fort.13 fort.15 fort.3[01] fort.3[3-5] fort.44 fort.46 run.log ds* output.* ??3d*.last10 $USER.work.$$/
+endif
+set DATESTAMP=`datestamp`
+(cd $USER.work.$$ ; tar cvf ../$DATESTAMP.tar .)
+mv $USER.work.$$/* .
+rmdir $USER.work.$$
+tar tvf $DATESTAMP.tar >& $DATESTAMP.tar.toc
+gzip -9 $DATESTAMP.tar

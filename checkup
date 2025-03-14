@@ -1,0 +1,34 @@
+#!/bin/bash
+echo "### Load ###"
+uptime
+echo
+echo "### Memory ###"
+free -h
+echo
+
+echo "### Write speed ###"
+cd $HOME
+printf "home:     speed ="
+dd if=/dev/zero of=./foo bs=8k count=10k 2>&1 | sed -n '3p' | cut -d ',' -f 3- | tr -d '\n' ; rm -f ./foo
+printf ", latency*100 ="
+dd if=/dev/zero of=./foo bs=512 count=100 oflag=dsync 2>&1 |awk 'NR==3 {split($0, fields, ","); print fields[2]}' ; rm -f ./foo
+cd - > /dev/null
+
+cd /nfs/pool002/users/$USER 
+printf "pool:     speed ="
+dd if=/dev/zero of=./foo bs=8k count=10k 2>&1 | sed -n '3p' | cut -d ',' -f 3- | tr -d '\n' ; rm -f ./foo
+printf ", latency*100 ="
+dd if=/dev/zero of=./foo bs=512 count=100 oflag=dsync 2>&1 |awk 'NR==3 {split($0, fields, ","); print fields[2]}' ; rm -f ./foo
+cd - > /dev/null
+
+#cd /nobackup1b/users/$USER
+#printf "nobackup: speed ="
+#dd if=/dev/zero of=./foo bs=8k count=10k 2>&1 | sed -n '3p' | cut -d ',' -f 3- | tr -d '\n' ; rm -f ./foo
+#printf ", latency*100 ="
+#dd if=/dev/zero of=./foo bs=512 count=100 oflag=dsync 2>&1 |awk 'NR==3 {split($0, fields, ","); print fields[2]}' ; rm -f ./foo
+#cd - > /dev/null
+#echo
+
+echo
+echo "### Disk quotas ###"
+timeout 10 quota -s #; lfs quota -h -u $USER /nobackup1 | sed -n '3p'
