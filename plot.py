@@ -493,18 +493,21 @@ def getConfigText():
         print(traceback.format_exc())
         txt += '\n' + r'$\bf{Pumping\ rate}$ ' + f"{type(e).__name__}: {e}"
 
-    if has_impurities:
-        try:
-            # Pumping S not really valid for full impurity model cases because of pdena[ntriang,natm=2 (D+Imp)]
-            D_pumped_flux, T_pumped_flux = get_pumped_fluxes()
-            xc, yc = get_triangle_centers()
-            mask = (1.78<xc)&(xc<1.835)&(-1.405<yc)&(yc<-1.385)
-            vals = np.sum(sp.pdena[:, :], axis=1)+2*np.sum(sp.pdenm[:, :], axis=1)
-            ngdiv = np.mean(vals.flatten()[mask])
-            pump_surface_area = 0.719 # m^-2
-            S_pump = (T_pumped_flux+D_pumped_flux)/pump_surface_area/ngdiv
-            txt += '\n' + f'$\\bf{{S_{{pump}}}}$ {S_pump:.3g}'
+    try:
+        D_pumped_flux, T_pumped_flux = get_pumped_fluxes(sp) # atoms/s
+        molecules_pumped_per_second = (T_pumped_flux+D_pumped_flux)/2
+    
+        # Calculate neutral density near pump
+        xc, yc = get_triangle_centers()
+        mask = (1.78<xc)&(xc<1.835)&(-1.405<yc)&(yc<-1.385)
+        vals = np.sum(sp.pdena[:, :], axis=1)+np.sum(sp.pdenm[:, :], axis=1)
+        nndiv = np.mean(vals.flatten()[mask])
 
+        # Calculate pumping speed
+        S_pump = molecules_pumped_per_second/nndiv # m^3/s
+        txt += '\n' + f'$\\bf{{S_{{pump}}}}$ {S_pump:.3g} m$^3$/s'
+
+        if has_impurity:
             # Compression for full impurity model cases assuming D+Imp only
             pumpMask = (1.78<xc)&(xc<1.9)&(-1.37<yc)&(yc<-1.33)
             nH0 = sp.pdena[:, 0]+2*sp.pdenm[:,0]
@@ -515,12 +518,12 @@ def getConfigText():
             nImpSep = float(interpolate.interp1d(yyc, sp.na[:,:,3:].sum(axis=2)[JXA+1,1:-1], kind='linear')(0))
             txt += '\n' + f'$\\bf{{H\\ compression}}$ {nH0Pump/nHSep:.3g} (n0_div={nH0Pump:.3g}/ni_sep,omp={nHSep:.3g})'
             txt += '\n' + f'$\\bf{{{n}\\ compression}}$ {nImp0Pump/nImpSep:.3g} (n0_div={nImp0Pump:.3g}/ni_sep,omp={nImpSep:.3g})'
-        except Exception as e:
-            print('full impurity model compression calculation error:', traceback.format_exc())
-            ngdiv = np.nan
-            S_pump = np.nan
-            D_pumped_flux = np.nan
-            T_pumped_flux = np.nan
+    except Exception as e:
+        print('full impurity model compression calculation error:', traceback.format_exc())
+        nndiv = np.nan
+        S_pump = np.nan
+        D_pumped_flux = np.nan
+        T_pumped_flux = np.nan
         
     try:
         t, f = get_b2tallies('fnayreg')
